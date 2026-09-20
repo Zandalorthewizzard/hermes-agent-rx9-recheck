@@ -219,12 +219,22 @@ class PluginLedgerMixin:
             return manifest_key(plugin.manifest)
         return manifest_key(plugin) if isinstance(plugin, PluginManifest) else str(plugin)
 
-    def unload(self, plugin: Union[str, PluginManifest, LoadedPlugin, None] = None) -> bool:
-        """Unload registrations while excluding discovery/deferred loading."""
-        with self._discovery_lock, _plugin_home_scope(self.home_path):
-            return self._unload_scoped(plugin)
+    def unload(
+        self, plugin: Union[str, PluginManifest, LoadedPlugin, None] = None, *, reason: str = "definitive",
+    ) -> bool:
+        """Unload registrations under an explicit lifecycle boundary.
 
-    def _unload_scoped(self, plugin: Union[str, PluginManifest, LoadedPlugin, None] = None) -> bool:
+        ``reason='replacement'`` is reserved for force discovery and preserves runtime slots;
+        ``reason='definitive'`` is used for disable/unload/shutdown and cleans them once.
+        """
+        if reason not in {"replacement", "definitive"}:
+            raise ValueError("plugin unload reason must be 'replacement' or 'definitive'")
+        with self._discovery_lock, _plugin_home_scope(self.home_path):
+            return self._unload_scoped(plugin, reason=reason)
+
+    def _unload_scoped(
+        self, plugin: Union[str, PluginManifest, LoadedPlugin, None] = None, *, reason: str = "definitive",
+    ) -> bool:
         """Unload one plugin (or all when ``plugin=None``, as force rediscovery does). Every ledger registration
         — including on_unload callbacks and supervised tasks — is disposed in reverse acquisition order with
         identity-conditional inverses. Returns ``True`` when anything was found."""
@@ -232,6 +242,11 @@ class PluginLedgerMixin:
         if unload_all:
             target_keys = set(self._ownership_ledger) | set(self._plugins)
             registrations = list(self._registration_order)
+            if reason == "definitive":
+                registrations.extend(
+                    r for owned in self._ownership_ledger.values() for r in owned
+                    if r.persistent and r.active
+                )
         else:
             target_keys = self._unload_target_keys(self._resolve_plugin_key(plugin))
             registrations = [r for r in self._registration_order if r.plugin_key in target_keys]
@@ -242,7 +257,11 @@ class PluginLedgerMixin:
             registrations.extend(
                 r for key in target_keys for r in self._ownership_ledger.get(key, []) if r.persistent and r.active
             )
-        found = bool(target_keys or registrations)
+        runtime_slot_keys = {
+            identity[1] for identity in self._runtime_slots
+            if unload_all or identity[1] in target_keys
+        }
+        found = bool(target_keys or registrations or runtime_slot_keys)
         self._dispose_registrations(registrations)
         self._forget_registrations(registrations)
         if unload_all:
@@ -250,12 +269,17 @@ class PluginLedgerMixin:
         else:
             for key in target_keys:
                 self._plugins.pop(key, None)
+        if reason == "definitive":
+            self._definitive_runtime_cleanup(None if unload_all else runtime_slot_keys)
         return found
 
     def _unload_target_keys(self, requested: str) -> Set[str]:
         """Resolve a targeted-unload request to canonical plugin keys (exact key, else by name)."""
         if requested in self._ownership_ledger or requested in self._plugins:
             return {requested}
+        runtime_keys = {identity[1] for identity in self._runtime_slots if identity[1] == requested}
+        if runtime_keys:
+            return runtime_keys
         return {key for key, loaded in self._plugins.items() if loaded.manifest.name == requested}
 
     def _reset_after_unload_all(self, registrations: List[PluginRegistration]) -> None:

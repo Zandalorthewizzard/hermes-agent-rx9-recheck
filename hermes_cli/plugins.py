@@ -59,6 +59,7 @@ from hermes_cli.plugins_dispatch import (  # noqa: F401 — re-exported
     is_valid_system_prompt_section_id,
 )
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
+from hermes_cli.plugins_runtime import PluginRuntimeSlot
 from hermes_cli.plugins_state import (
     PluginState, _locked_plugin_state, _nested_plugin_mapping, _nested_plugin_value,
     _plugin_relative_segments, _plugin_settings_entry,
@@ -234,6 +235,12 @@ class PluginContext:
     def plugin_id(self) -> str:
         """Return the effective registry id used for this plugin's namespaces."""
         return manifest_key(self.manifest)
+
+    def runtime_slot(self, key: str) -> PluginRuntimeSlot:
+        """Return a host-owned runtime slot scoped to this profile and plugin."""
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("runtime slot key must be a non-empty string")
+        return self._manager._runtime_slot(self.plugin_id, key)
 
     def has_plugin(self, plugin_id: str) -> bool:
         """Return True when another plugin is loaded and enabled (runtime probe for advisory
@@ -1140,6 +1147,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self.scope_key = scope_key or hermes_home_key()
         self.home_path = Path(self.scope_key)
         self._discovery_lock = threading.RLock()
+        self._runtime_slots: Dict[Tuple[str, str, str], PluginRuntimeSlot] = {}
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         self._gateway_message_injector: tuple[object, Callable] | None = None
@@ -1225,6 +1233,27 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         registered = self._gateway_message_injector
         return registered is not None and bool(registered[1](**kwargs))
 
+    def _runtime_slot(self, plugin_key: str, local_key: str) -> PluginRuntimeSlot:
+        """Return the manager-owned slot for ``(scope, canonical plugin, local key)``."""
+        identity = (self.scope_key, plugin_key, local_key)
+        with self._discovery_lock:
+            return self._runtime_slots.setdefault(identity, PluginRuntimeSlot())
+
+    def _definitive_runtime_cleanup(self, plugin_keys: Optional[Set[str]] = None) -> None:
+        """Dispose runtime slots after their plugin registrations are no longer reachable."""
+        selected = []
+        for identity, slot in list(self._runtime_slots.items()):
+            if plugin_keys is None or identity[1] in plugin_keys:
+                selected.append((identity, slot))
+                self._runtime_slots.pop(identity, None)
+        for identity, slot in selected:
+            try:
+                slot._cleanup_definitive()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clean runtime slot %s/%s: %s", identity[1], identity[2], exc,
+                )
+
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found; ``force`` unloads first so config
         changes / new bundled backends become visible in long-lived sessions."""
@@ -1232,7 +1261,8 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             if self._discovered and not force:
                 return
             if force:
-                self.unload()  # the ledger owns teardown of process-global registries
+                # Force discovery replaces registrations but preserves host-owned runtime slots.
+                self._unload_scoped(None, reason="replacement")
             if env_var_enabled("HERMES_SAFE_MODE"):
                 logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
                 self._discovered = True
@@ -1596,6 +1626,16 @@ def discover_plugins(force: bool = False) -> None:
     background discovery instead of racing a second scan."""
     _join_background_discovery()
     get_plugin_manager().discover_and_load(force=force)
+
+
+def shutdown_plugins() -> None:
+    """Definitively tear down every profile-scoped plugin manager owned by this process."""
+    with _plugin_managers_lock:
+        managers = list(dict.fromkeys(_plugin_managers_by_home.values()))
+        if _plugin_manager is not None and _plugin_manager not in managers:
+            managers.append(_plugin_manager)
+    for manager in managers:
+        manager.unload(reason="definitive")
 
 
 _background_discovery_thread: Optional[threading.Thread] = None
