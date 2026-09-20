@@ -1778,6 +1778,9 @@ class GatewayShutdownMixin:
         # self-terminates anyway.
         self._background_tasks.clear()
         self.adapters.clear()
+        with _log_suppressed(logging.WARNING, "Definitive plugin cleanup during gateway shutdown failed: %s"):
+            from hermes_cli.plugins import shutdown_plugins
+            shutdown_plugins()
         for _session_key in list(self._running_agents):
             self._release_running_agent_state(_session_key)
         # Flush pending messages before clearing: under FTS5 corruption they are the only surviving copy.
