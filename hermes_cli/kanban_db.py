@@ -4223,6 +4223,166 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class ConditionalClaimResult:
+    """Result of an atomic conditional native task claim.
+
+    ``outcome`` is one of ``accepted``, ``conflict``, or ``not_found``.
+    ``task`` and ``snapshot`` contain the durable native state observed by the
+    operation whenever the task exists.  A conflict never mutates the board.
+    """
+
+    outcome: str
+    task: Optional[Task]
+    snapshot: Optional[str]
+    run_id: Optional[int] = None
+
+
+def _claim_snapshot(conn: sqlite3.Connection, task: Task) -> str:
+    """Return an opaque token for the state relevant to a ready-task claim.
+
+    The token deliberately excludes presentation and historical fields.  It
+    binds the board/database, task identity, the ready/claim/run fields, and
+    the fields copied into a new run.  Parent links and statuses are included
+    because they are an eligibility gate in :func:`claim_task`.
+    """
+    parents = conn.execute(
+        "SELECT l.parent_id, p.status FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? ORDER BY l.parent_id",
+        (task.id,),
+    ).fetchall()
+    database = conn.execute("PRAGMA database_list").fetchone()
+    payload = {
+        "version": 1,
+        "database": database[2] if database else "",
+        "task_id": task.id,
+        "status": task.status,
+        "assignee": task.assignee,
+        "claim_lock": task.claim_lock,
+        "claim_expires": task.claim_expires,
+        "current_run_id": task.current_run_id,
+        "current_step_key": task.current_step_key,
+        "max_runtime_seconds": task.max_runtime_seconds,
+        "parents": [(row["parent_id"], row["status"]) for row in parents],
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def task_claim_snapshot(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the current opaque conditional-claim snapshot for ``task_id``."""
+    task = get_task(conn, task_id)
+    return _claim_snapshot(conn, task) if task else None
+
+
+def _claim_ready_task_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    now: int,
+    lock: str,
+    expires: int,
+) -> Optional[Task]:
+    """Perform Hermes's existing ready-task claim mutation in an open txn."""
+    # Structural invariant: never transition ready -> running while any
+    # parent is not yet 'done'. This is the single enforcement point
+    # regardless of which writer (create_task, link_tasks, unblock_task,
+    # release_stale_claims, manual SQL) set status='ready'. If a racy
+    # writer promoted a task with undone parents, demote it back to
+    # 'todo' here — recompute_ready will re-promote when the parents
+    # actually finish. See RCA at
+    # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+    undone = conn.execute(
+        "SELECT 1 FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if undone:
+        conn.execute(
+            "UPDATE tasks SET status = 'todo' "
+            "WHERE id = ? AND status = 'ready'",
+            (task_id,),
+        )
+        _append_event(
+            conn, task_id, "claim_rejected",
+            {"reason": "parents_not_done"},
+        )
+        return None
+    # Defensive: if a prior run somehow leaked (invariant violation from
+    # an unknown code path), close it as 'reclaimed' so we don't strand
+    # it when the CAS resets the pointer below. No-op when the invariant
+    # holds (the common case).
+    stale = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
+        (task_id,),
+    ).fetchone()
+    if stale and stale["current_run_id"]:
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'reclaimed', outcome = 'reclaimed',
+                   summary = COALESCE(summary, 'invariant recovery on re-claim'),
+                   ended_at = ?,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+             WHERE id = ? AND ended_at IS NULL
+            """,
+            (now, int(stale["current_run_id"])),
+        )
+    cur = conn.execute(
+        """
+        UPDATE tasks
+           SET status        = 'running',
+               claim_lock    = ?,
+               claim_expires = ?,
+               started_at    = COALESCE(started_at, ?)
+         WHERE id = ?
+           AND status = 'ready'
+           AND claim_lock IS NULL
+        """,
+        (lock, expires, now, task_id),
+    )
+    if cur.rowcount != 1:
+        return None
+    # Look up the current task row so we can populate the run with
+    # its assignee / step / runtime cap.
+    trow = conn.execute(
+        "SELECT assignee, max_runtime_seconds, current_step_key "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    run_cur = conn.execute(
+        """
+        INSERT INTO task_runs (
+            task_id, profile, step_key, status,
+            claim_lock, claim_expires, max_runtime_seconds,
+            started_at
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            trow["assignee"] if trow else None,
+            trow["current_step_key"] if trow else None,
+            lock,
+            expires,
+            trow["max_runtime_seconds"] if trow else None,
+            now,
+        ),
+    )
+    run_id = run_cur.lastrowid
+    conn.execute(
+        "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+        (run_id, task_id),
+    )
+    _append_event(
+        conn, task_id, "claimed",
+        {"lock": lock, "expires": expires, "run_id": run_id},
+        run_id=run_id,
+    )
+    return get_task(conn, task_id)
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4239,102 +4399,12 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. This is the single enforcement point
-        # regardless of which writer (create_task, link_tasks, unblock_task,
-        # release_stale_claims, manual SQL) set status='ready'. If a racy
-        # writer promoted a task with undone parents, demote it back to
-        # 'todo' here — recompute_ready will re-promote when the parents
-        # actually finish. See RCA at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if undone:
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'",
-                (task_id,),
-            )
-            _append_event(
-                conn, task_id, "claim_rejected",
-                {"reason": "parents_not_done"},
-            )
-            return None
-        # Defensive: if a prior run somehow leaked (invariant violation from
-        # an unknown code path), close it as 'reclaimed' so we don't strand
-        # it when the CAS resets the pointer below. No-op when the invariant
-        # holds (the common case).
-        stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
-            (task_id,),
-        ).fetchone()
-        if stale and stale["current_run_id"]:
-            conn.execute(
-                """
-                UPDATE task_runs
-                   SET status = 'reclaimed', outcome = 'reclaimed',
-                       summary = COALESCE(summary, 'invariant recovery on re-claim'),
-                       ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-                 WHERE id = ? AND ended_at IS NULL
-                """,
-                (now, int(stale["current_run_id"])),
-            )
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
-             WHERE id = ?
-               AND status = 'ready'
-               AND claim_lock IS NULL
-            """,
-            (lock, expires, now, task_id),
+        claimed = _claim_ready_task_in_txn(
+            conn, task_id, now=now, lock=lock, expires=expires,
         )
-        if cur.rowcount != 1:
-            return None
-        # Look up the current task row so we can populate the run with
-        # its assignee / step / runtime cap.
-        trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        run_cur = conn.execute(
-            """
-            INSERT INTO task_runs (
-                task_id, profile, step_key, status,
-                claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                trow["assignee"] if trow else None,
-                trow["current_step_key"] if trow else None,
-                lock,
-                expires,
-                trow["max_runtime_seconds"] if trow else None,
-                now,
-            ),
-        )
-        run_id = run_cur.lastrowid
-        conn.execute(
-            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
-            (run_id, task_id),
-        )
-        _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
-            run_id=run_id,
-        )
-        claimed = get_task(conn, task_id)
+    if claimed is None:
+        return None
+    run_id = claimed.current_run_id
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -4343,6 +4413,52 @@ def claim_task(
         run_id=run_id,
     )
     return claimed
+
+
+def claim_task_if_current(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_snapshot: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> ConditionalClaimResult:
+    """Claim a ready task only when its native snapshot is still current.
+
+    Comparison and the existing native claim mutation share one Hermes-owned
+    write transaction.  The conflict path has no task, run, event, hook, or
+    dispatch side effect.
+    """
+    now = int(time.time())
+    lock = claimer or _claimer_id()
+    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    with write_txn(conn):
+        current = get_task(conn, task_id)
+        if current is None:
+            return ConditionalClaimResult("not_found", None, None)
+        current_snapshot = _claim_snapshot(conn, current)
+        if not secrets.compare_digest(expected_snapshot, current_snapshot):
+            return ConditionalClaimResult("conflict", current, current_snapshot)
+        claimed = _claim_ready_task_in_txn(
+            conn, task_id, now=now, lock=lock, expires=expires,
+        )
+        if claimed is None:
+            current = get_task(conn, task_id)
+            return ConditionalClaimResult(
+                "conflict",
+                current,
+                _claim_snapshot(conn, current) if current else None,
+            )
+        accepted_snapshot = _claim_snapshot(conn, claimed)
+        run_id = claimed.current_run_id
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_claimed",
+        task_id,
+        board=get_current_board(),
+        assignee=claimed.assignee,
+        run_id=run_id,
+    )
+    return ConditionalClaimResult("accepted", claimed, accepted_snapshot, run_id)
 
 
 def claim_review_task(
